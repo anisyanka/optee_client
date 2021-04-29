@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <time.h>
 #include <tee_client_api.h>
 #include <teec_trace.h>
 #include <unistd.h>
@@ -23,6 +24,8 @@
 #include "ck_helpers.h"
 #include "invoke_ta.h"
 #include "local_utils.h"
+
+#define CLIENT_SALT_SIZE	16
 
 struct ta_context {
 	pthread_mutex_t init_mutex;
@@ -239,48 +242,25 @@ CK_RV ckteec_invoke_init(void)
 	TEEC_UUID uuid = PKCS11_TA_UUID;
 	uint32_t origin = 0;
 	TEEC_Result res = TEEC_SUCCESS;
+	TEEC_Operation op = { };
 	CK_RV rv = CKR_CRYPTOKI_ALREADY_INITIALIZED;
-	const char *login_type_env = NULL;
-	const char *login_gid_env = NULL;
-	uint32_t login_method = TEEC_LOGIN_PUBLIC;
-	void *login_data = NULL;
-	gid_t login_gid = 0;
-	unsigned long tmpconv = 0;
-	char *endp = NULL;
 	int e = 0;
+	size_t i = 0;
 
-	login_type_env = getenv("CKTEEC_LOGIN_TYPE");
+	union random
+	{
+		int int_arr[CLIENT_SALT_SIZE / sizeof(int)];
+		char char_arr[CLIENT_SALT_SIZE];
+	} random = { };
 
-	if (login_type_env) {
-		if (strcmp(login_type_env, "public") == 0) {
-			login_method = TEEC_LOGIN_PUBLIC;
-		} else if (strcmp(login_type_env, "user") == 0) {
-			login_method = TEEC_LOGIN_USER;
-		} else if (strcmp(login_type_env, "group") == 0) {
-			login_gid_env = getenv("CKTEEC_LOGIN_GID");
-			if (!login_gid_env || !strlen(login_gid_env)) {
-				EMSG("missing CKTEEC_LOGIN_GID");
-				rv = CKR_ARGUMENTS_BAD;
-				goto out;
-			}
-
-			login_method = TEEC_LOGIN_GROUP;
-			tmpconv = strtoul(login_gid_env, &endp, 10);
-			if (errno == ERANGE || tmpconv > (gid_t)-1 ||
-			    (login_gid_env + strlen(login_gid_env) != endp)) {
-				EMSG("failed to convert CKTEEC_LOGIN_GID");
-				rv = CKR_ARGUMENTS_BAD;
-				goto out;
-			}
-
-			login_gid = (gid_t)tmpconv;
-			login_data = &login_gid;
-		} else {
-			EMSG("invalid value for CKTEEC_LOGIN_TYPE");
-			rv = CKR_ARGUMENTS_BAD;
-			goto out;
-		}
-	}
+	struct login_session {
+		uint32_t method;
+		const char *method_as_str;
+	} login_sessions[] = {
+		{ TEEC_LOGIN_USER, "TEEC_LOGIN_USER" },
+		{ TEEC_LOGIN_APPLICATION, "TEEC_LOGIN_APPLICATION" },
+		{ TEEC_LOGIN_USER_APPLICATION, "TEEC_LOGIN_USER_APPLICATION" },
+	};
 
 	e = pthread_mutex_lock(&ta_ctx.init_mutex);
 	if (e)
@@ -298,13 +278,68 @@ CK_RV ckteec_invoke_init(void)
 		goto out;
 	}
 
-	res = TEEC_OpenSession(&ta_ctx.context, &ta_ctx.session, &uuid,
-			       login_method, login_data, NULL, &origin);
-	if (res != TEEC_SUCCESS) {
-		EMSG("TEEC open session failed %x from %d\n", res, origin);
-		TEEC_FinalizeContext(&ta_ctx.context);
-		rv = CKR_DEVICE_ERROR;
-		goto out;
+	/*
+	 * Generate random bytes for this client.
+	 * This can help to identify current client, when logic with
+	 * calculating several CA_UUIDs is still in progress (see below).
+	 *
+	 * This can protect a CA if any malicious client communicates
+	 * in a way that bypasses libckteec.
+	 */
+	srand(time(NULL));
+	COMPILE_TIME_ASSERT((CLIENT_SALT_SIZE % sizeof(int)) == 0);
+	for (i = 0; i < CLIENT_SALT_SIZE / sizeof(int); ++i)
+		random.int_arr[i] = rand();
+
+	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, 0, 0, 0);
+	op.params[0].tmpref.buffer = random.char_arr;
+	op.params[0].tmpref.size = CLIENT_SALT_SIZE;
+
+	/*
+	 * Every CAs must have the ability to create own keys, certificates or
+	 * data in own token. TA must create tokens for this particular CA opening a
+	 * tee session, if they don't exist.
+
+	 * Every CA has three tokens:
+	 * - "USER" - data in this token are shared between all application
+	 *            for a particular user.
+	 * - "APPLICATION" - data in this token are accessed only for a particaular CA, 
+	 *                   but shared between all users.
+	 * - "USER+APPLICATION" - data in this token are accessed only for a particular
+	 *                        couple user+app.
+
+	 * Every token in the pkcs11-ta has an own name for persistent object in secure
+	 * storage based on calculated CA_UUID:
+	 * - Token "USER" has <ca-uuid-based-on-USER-login-method>.
+	 * - Token "APPLICATION" has <ca-uuid-based-on-APP-login-method>.
+	 * - Token "USER+APPLICATION" has "token.<ca-uuid-based-on-USERAPP-login-method>".
+	 * These names are used by the TA to have an access to token persistent file in
+	 * seruce storage. C_GetSlotList() will return slots with tokens are available
+	 * only for particular CA. 
+
+	 * To make this logic available, it is needed to open several tee-sessions
+	 * one after another with different login methods. If TA returns "OK",
+	 * then to close session. It means TA successfully has created a token
+	 * or this token alredy exists.
+
+	 * Last session is opened with <TEEC_LOGIN_USER_APPLICATION> method and isn't closed.
+	 * CA will use this session to interact with TA. 
+	 */
+
+	for (i = 0; i < ARRAY_SIZE(login_sessions); ++i) {
+		res = TEEC_OpenSession(&ta_ctx.context, &ta_ctx.session, &uuid,
+			login_sessions[i].method, NULL, &op, &origin);
+		if (res == TEEC_SUCCESS) {
+			if (login_sessions[i].method !=
+					TEEC_LOGIN_USER_APPLICATION)
+				TEEC_CloseSession(&ta_ctx.session);
+		} else {
+			EMSG("TEEC open session with <%s> failed %x from %d\n",
+			     login_sessions[i].method_as_str, res, origin);
+			TEEC_FinalizeContext(&ta_ctx.context);
+			rv = CKR_DEVICE_ERROR;
+			goto out;
+		}
 	}
 
 	rv = ping_ta();
